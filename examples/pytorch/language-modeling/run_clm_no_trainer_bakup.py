@@ -55,10 +55,6 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from e2eAIOK.DeNas.thirdparty.supernet_hf import SuperHFModelForCausalLM
-from e2eAIOK.DeNas.thirdparty.utils import decode_arch
-from e2eAIOK.ModelAdapter.engine_core.distiller import KD
-from e2eAIOK.ModelAdapter.engine_core.transferrable_model import *
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.27.0.dev0")
@@ -102,13 +98,6 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
     )
-    parser.add_argument(
-        "--teacher_model_name_or_path",
-        type=str,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    
     parser.add_argument(
         "--config_name",
         type=str,
@@ -231,22 +220,6 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
-
-    parser.add_argument(
-        "--is_denas",
-       action='store_true'
-    )
-
-    parser.add_argument(
-        "--eval",
-       action='store_true'
-    )
-
-    parser.add_argument(
-        "--is_transferrable",
-       action='store_true'
-    )
-
     args = parser.parse_args()
 
     # Sanity checks
@@ -378,64 +351,39 @@ def main():
     #
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    if not args.is_denas:
-        if args.config_name:
-            config = AutoConfig.from_pretrained(args.config_name)
-        elif args.model_name_or_path:
-            config = AutoConfig.from_pretrained(args.model_name_or_path)
-        else:
-            config = CONFIG_MAPPING[args.model_type]()
-            logger.warning("You are instantiating a new config instance from scratch.")
-
-        if args.tokenizer_name:
-            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
-        elif args.model_name_or_path:
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-        else:
-            raise ValueError(
-                "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-                "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-            )
-
-        if args.model_name_or_path:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path,
-                from_tf=bool(".ckpt" in args.model_name_or_path),
-                config=config,
-            )
-        else:
-            logger.info("Training new model from scratch")
-            model = AutoModelForCausalLM.from_config(config)
+    if args.config_name:
+        config = AutoConfig.from_pretrained(args.config_name)
+    elif args.model_name_or_path:
+        config = AutoConfig.from_pretrained(args.model_name_or_path)
     else:
-        submodel_config = decode_arch(os.path.join(args.model_name_or_path, "best_model_structure.txt"))
-        model = SuperHFModelForCausalLM.set_sample_config(args.model_name_or_path, **submodel_config )
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+        config = CONFIG_MAPPING[args.model_type]()
+        logger.warning("You are instantiating a new config instance from scratch.")
+
+    if args.tokenizer_name:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+    elif args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    else:
+        raise ValueError(
+            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+        )
+
+    if args.model_name_or_path:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+    else:
+        logger.info("Training new model from scratch")
+        model = AutoModelForCausalLM.from_config(config)
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
-
-    if args.is_transferrable:
-        ###########################Prepare teacher model############################
-        teacher_config = AutoConfig.from_pretrained(args.teacher_model_name_or_path)
-        teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model_name_or_path,
-            from_tf=bool(".ckpt" in args.teacher_model_name_or_path),
-            config=teacher_config,
-        )
-
-        teacher_embedding_size = teacher_model.get_input_embeddings().weight.shape[0]
-        if len(tokenizer) > teacher_embedding_size:
-            teacher_model.resize_token_embeddings(len(tokenizer))
-        ###########################end of prepare teacher model############################
-
-        ###########################Prepare distiller############################
-        distiller= KD(teacher_model,teacher_type="huggingface_gpt2")
-        loss_fn = None
-        model = make_transferrable_with_knowledge_distillation(model,loss_fn,distiller,backbone_loss_weight=0.1,distiller_loss_weight=0.9)
-        ###########################end of prepare distiller############################
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -620,33 +568,11 @@ def main():
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
-    if args.eval:
-        model.eval()
-        backbone = model.backbone if args.is_transferrable else model
-        losses = []
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = backbone(**batch)
-
-            loss = outputs.loss
-            losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
-
-        losses = torch.cat(losses)
-        try:
-            eval_loss = torch.mean(losses)
-            perplexity = math.exp(eval_loss)
-        except OverflowError:
-            perplexity = float("inf")
-
-        logger.info(f" perplexity: {perplexity} eval_loss: {eval_loss}")
-        return
-
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
             total_loss = 0
         for step, batch in enumerate(train_dataloader):
-            batch["output_hidden_states"] = True
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == starting_epoch:
                 if resume_step is not None and step < resume_step:
@@ -656,13 +582,8 @@ def main():
                     continue
 
             with accelerator.accumulate(model):
-                if args.is_transferrable:
-                    outputs = model(batch)
-                    losses = model.loss(outputs, None)
-                    loss = losses.total_loss
-                else:
-                    outputs = model(**batch)
-                    loss = outputs.loss
+                outputs = model(**batch)
+                loss = outputs.loss
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
@@ -670,12 +591,6 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
-            if step % 10 == 0:
-                if args.is_transferrable:
-                    print(f"total loss: {losses.total_loss}, backbone loss: {losses.backbone_loss}, distiller loss: {losses.distiller_loss}")
-                else:
-                    print(f"loss: {loss}")
-
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -692,11 +607,10 @@ def main():
                 break
 
         model.eval()
-        backbone = model.backbone if args.is_transferrable else model
         losses = []
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
-                outputs = backbone(**batch)
+                outputs = model(**batch)
 
             loss = outputs.loss
             losses.append(accelerator.gather_for_metrics(loss.repeat(args.per_device_eval_batch_size)))
@@ -743,7 +657,7 @@ def main():
     if args.with_tracking:
         accelerator.end_training()
 
-    if args.output_dir is not None and not args.is_transferrable:
+    if args.output_dir is not None:
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(
